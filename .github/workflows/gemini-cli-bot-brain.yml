@@ -29,35 +29,28 @@ on:
         default: false
 
 concurrency:
-  group: '${{ github.workflow }}-${{ github.event.issue.number || github.event.pull_request.number || github.event.inputs.issue_number || github.ref }}'
+  group: '${{ github.workflow }}-${{ github.event.issue.number || github.event.pull_request.number || inputs.issue_number || github.ref }}'
   cancel-in-progress: true
 
 jobs:
   run-brain:
     name: 'Background Agent (Brain)'
-    if: github.repository == 'google-gemini/gemini-cli' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.run_interactive != 'true'))
+    if: "github.repository == 'google-gemini/gemini-cli' && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.run_interactive == false))"
     uses: ./.github/workflows/gemini-cli-bot-core.yml
     with:
       prompt_path: 'tools/gemini-cli-bot/brain/metrics.md'
-      enable_prs: ${{ github.event.inputs.enable_prs == 'true' }}
-      clear_memory: ${{ github.event.inputs.clear_memory == 'true' }}
+      enable_prs: ${{ inputs.enable_prs == true }}
+      clear_memory: ${{ inputs.clear_memory == true }}
     secrets: inherit
 
   run-interactive:
     name: 'Interactive Agent'
-    if: |
-      github.repository == 'google-gemini/gemini-cli' && (
-        (github.event_name == 'workflow_dispatch' && github.event.inputs.run_interactive == 'true') || (
-          github.event_name == 'issue_comment' &&
-          contains(github.event.comment.body, '@gemini-cli-robot') && 
-          contains(fromJSON('["COLLABORATOR", "MEMBER", "OWNER"]'), github.event.comment.author_association)
-        )
-      )
+    if: "github.repository == 'google-gemini/gemini-cli' && ((github.event_name == 'workflow_dispatch' && inputs.run_interactive == true) || (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@gemini-cli-robot') && contains(fromJSON('[\"COLLABORATOR\", \"MEMBER\", \"OWNER\"]'), github.event.comment.author_association)))"
     uses: ./.github/workflows/gemini-cli-bot-core.yml
     with:
       prompt_path: 'tools/gemini-cli-bot/brain/interactive.md'
       enable_prs: true
-      trigger_issue_number: '${{ github.event.issue.number || github.event.inputs.issue_number }}'
-      trigger_comment_id: '${{ github.event.comment.id || github.event.inputs.comment_id }}'
+      trigger_issue_number: '${{ github.event.issue.number || inputs.issue_number }}'
+      trigger_comment_id: '${{ github.event.comment.id || inputs.comment_id }}'
       memory_workflow: '🧠 Gemini CLI Bot: Brain'
     secrets: inherit

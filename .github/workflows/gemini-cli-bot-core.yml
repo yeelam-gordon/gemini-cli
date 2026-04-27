@@ -1,0 +1,260 @@
+name: '🤖 Gemini CLI Bot: Core'
+
+on:
+  workflow_call:
+    inputs:
+      prompt_path:
+        description: 'Path to the base markdown prompt'
+        type: 'string'
+        required: true
+      enable_prs:
+        description: 'Enable PRs (automatically promote changes to PRs)'
+        type: 'boolean'
+        default: false
+      trigger_issue_number:
+        description: 'The issue/PR number that invoked the bot'
+        type: 'string'
+        required: false
+      trigger_comment_id:
+        description: 'The specific comment ID that invoked the bot'
+        type: 'string'
+        required: false
+      clear_memory:
+        description: 'Clear memory (drops learnings from previous runs)'
+        type: 'boolean'
+        default: false
+      memory_workflow:
+        description: 'The workflow name to download memory from'
+        type: 'string'
+        default: ''
+
+jobs:
+  reasoning:
+    name: 'Brain (Reasoning Layer)'
+    runs-on: 'ubuntu-latest'
+    if: "github.repository == 'google-gemini/gemini-cli'"
+    # The reasoning phase is strictly readonly.
+    permissions:
+      contents: 'read'
+      issues: 'read'
+      pull-requests: 'read'
+      actions: 'read'
+    env:
+      GEMINI_CLI_TRUST_WORKSPACE: 'true'
+    steps:
+      - name: 'Checkout'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 'Setup Node.js'
+        uses: 'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020' # ratchet:actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 'Install dependencies'
+        run: 'npm ci'
+
+      - name: 'Build Gemini CLI'
+        run: 'npm run bundle'
+
+      - name: 'Download Previous State'
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+        run: |
+          if [ "${{ inputs.clear_memory }}" = "true" ]; then
+            echo "Memory clear requested. Skipping previous state download."
+            exit 0
+          fi
+
+          # Use provided memory_workflow or fallback to current workflow
+          WORKFLOW_NAME="${{ inputs.memory_workflow }}"
+          if [ -z "$WORKFLOW_NAME" ]; then
+            WORKFLOW_NAME="${{ github.workflow }}"
+          fi
+
+          echo "Downloading memory from workflow: $WORKFLOW_NAME"
+
+          # Find the last successful run of the specified workflow
+          LAST_RUN_ID=$(gh run list --workflow "$WORKFLOW_NAME" --status success --limit 1 --json databaseId --jq '.[0].databaseId')
+
+          if [ -n "$LAST_RUN_ID" ]; then
+            echo "Found previous successful run: $LAST_RUN_ID"
+            gh run download "$LAST_RUN_ID" -n brain-data -D . || echo "brain-data not found"
+          else
+            echo "No previous successful run found."
+          fi
+
+      - name: 'Collect Current Metrics'
+        env:
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+        run: 'npx tsx tools/gemini-cli-bot/metrics/index.ts'
+
+      - name: 'Prepare Metrics'
+        run: |
+          if [ -f "tools/gemini-cli-bot/history/metrics-before.csv" ]; then
+            mv tools/gemini-cli-bot/history/metrics-before.csv tools/gemini-cli-bot/history/metrics-before-prev.csv
+          fi
+
+      - name: 'Run Brain Phases'
+        env:
+          GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          GEMINI_MODEL: 'gemini-3-flash-preview'
+          ENABLE_PRS: "${{ inputs.enable_prs }}"
+        run: |
+          # Assemble the final prompt
+          touch trigger_context.md
+          if [ -n "${{ inputs.trigger_issue_number }}" ]; then
+            echo "# Interactive Trigger Context" > trigger_context.md
+            echo "You were invoked by a user in issue/PR #${{ inputs.trigger_issue_number }}." >> trigger_context.md
+            
+            if [ -n "${{ inputs.trigger_comment_id }}" ]; then
+              echo "## User Comment" >> trigger_context.md
+              gh api "repos/${{ github.repository }}/issues/comments/${{ inputs.trigger_comment_id }}" -q '.body' >> trigger_context.md
+              echo "" >> trigger_context.md
+            fi
+            
+            echo "## Issue/PR Context" >> trigger_context.md
+            gh issue view "${{ inputs.trigger_issue_number }}" >> trigger_context.md 2>/dev/null || gh pr view "${{ inputs.trigger_issue_number }}" >> trigger_context.md
+          fi
+
+          cat trigger_context.md "${{ inputs.prompt_path }}" tools/gemini-cli-bot/brain/common.md > combined_prompt.md
+          
+          node bundle/gemini.js --policy tools/gemini-cli-bot/ci-policy.toml -p "$(cat combined_prompt.md)"
+
+      - name: 'Run Critique Phase'
+        if: "${{ inputs.enable_prs == true }}"
+        env:
+          GEMINI_API_KEY: '${{ secrets.GEMINI_API_KEY }}'
+          GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}'
+          GEMINI_MODEL: 'gemini-3-flash-preview'
+        run: |
+          if git diff --staged --quiet; then
+             echo "No changes staged. Skipping critique."
+             echo "[APPROVED]" > critique_result.txt
+          else
+             node bundle/gemini.js --policy tools/gemini-cli-bot/ci-policy.toml -p "$(cat tools/gemini-cli-bot/brain/critique.md)" 2>&1 | tee critique_output.log
+
+             if [ "${PIPESTATUS[0]}" -ne 0 ] || grep -q "\[REJECTED\]" critique_output.log; then
+               echo "Critique failed or rejected changes. Skipping PR creation."
+               echo "[REJECTED]" > critique_result.txt
+             else
+               echo "[APPROVED]" > critique_result.txt
+             fi
+          fi
+
+      - name: 'Generate Patch'
+        if: "${{ inputs.enable_prs == true }}"
+        run: |
+          touch bot-changes.patch
+          touch pr-description.md
+          if [ -f critique_result.txt ] && grep -q "\[REJECTED\]" critique_result.txt; then
+             echo "Critique rejected. Skipping patch generation."
+          else
+             git diff --staged > bot-changes.patch
+          fi
+
+      - name: 'Archive Brain Data'
+        uses: 'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02' # ratchet:actions/upload-artifact@v4
+        with:
+          name: 'brain-data'
+          path: |
+            tools/gemini-cli-bot/lessons-learned.md
+            tools/gemini-cli-bot/history/*.csv
+            bot-changes.patch
+            pr-description.md
+            branch-name.txt
+            pr-comment.md
+            pr-number.txt
+            issue-comment.md
+          retention-days: 90
+
+  publish:
+    name: 'Publish Artifacts (Archive Layer)'
+    needs: 'reasoning'
+    runs-on: 'ubuntu-latest'
+    if: "github.repository == 'google-gemini/gemini-cli'"
+    permissions:
+      contents: 'write'
+      pull-requests: 'write'
+      actions: 'write'
+    steps:
+      - name: 'Checkout'
+        uses: 'actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8' # ratchet:actions/checkout@v5
+        with:
+          ref: 'main'
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: 'Download Brain Data'
+        uses: 'actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093' # ratchet:actions/download-artifact@v4
+        with:
+          name: 'brain-data'
+          path: '${{ runner.temp }}/brain-data/'
+
+      - name: 'Create or Update PR'
+        if: "${{ inputs.enable_prs == true }}"
+        env:
+          GH_TOKEN: '${{ secrets.GEMINI_CLI_ROBOT_GITHUB_PAT }}'
+        run: |
+          if [ -s "${{ runner.temp }}/brain-data/bot-changes.patch" ]; then
+            git config user.name "gemini-cli-robot"
+            git config user.email "gemini-cli-robot@google.com"
+            git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+
+            BRANCH_NAME="bot/productivity-updates-$(date +'%Y%m%d%H%M%S')-${{ github.run_id }}"
+            if [ -f "${{ runner.temp }}/brain-data/branch-name.txt" ]; then
+              BRANCH_NAME=$(cat "${{ runner.temp }}/brain-data/branch-name.txt")
+            fi
+
+            if [[ ! "$BRANCH_NAME" =~ ^bot/ ]]; then
+              echo "Error: Branch name '$BRANCH_NAME' does not start with 'bot/'. Safety abort."
+              exit 1
+            fi
+
+            git checkout -b "$BRANCH_NAME"
+            git apply "${{ runner.temp }}/brain-data/bot-changes.patch"
+            git add .
+
+            if [ -s "${{ runner.temp }}/brain-data/pr-description.md" ]; then
+              git commit -F "${{ runner.temp }}/brain-data/pr-description.md"
+            else
+              git commit -m "🤖 Gemini Bot Productivity Optimizations"
+            fi
+
+            git push origin "$BRANCH_NAME" --force
+
+            PR_TITLE="🤖 Gemini Bot Productivity Optimizations"
+            if [ -s "${{ runner.temp }}/brain-data/pr-description.md" ]; then
+              PR_TITLE=$(head -n 1 "${{ runner.temp }}/brain-data/pr-description.md")
+            fi
+
+            if ! gh pr view "$BRANCH_NAME" > /dev/null 2>&1; then
+              gh pr create --draft --title "$PR_TITLE" --body-file "${{ runner.temp }}/brain-data/pr-description.md" --head "$BRANCH_NAME" --base main || \
+              gh pr create --draft --title "🤖 Gemini Bot Productivity Optimizations" --body "Automated changes generated by Gemini CLI Bot." --head "$BRANCH_NAME" --base main
+            fi
+          fi
+
+      - name: 'Post PR/Issue Comment'
+        env:
+          GH_TOKEN: '${{ secrets.GEMINI_CLI_ROBOT_GITHUB_PAT }}'
+        run: |
+          # 1. Post comment back to the triggering issue/PR (if applicable)
+          if [ -s "${{ runner.temp }}/brain-data/issue-comment.md" ] && [ -n "${{ inputs.trigger_issue_number }}" ]; then
+            echo "Posting comment to triggering issue #${{ inputs.trigger_issue_number }}"
+            gh issue comment "${{ inputs.trigger_issue_number }}" -F "${{ runner.temp }}/brain-data/issue-comment.md"
+          fi
+
+          # 2. Post comment to the newly created/updated PR (standard brain behavior)
+          if [ -s "${{ runner.temp }}/brain-data/pr-comment.md" ] && [ -f "${{ runner.temp }}/brain-data/pr-number.txt" ]; then
+            PR_NUM=$(cat "${{ runner.temp }}/brain-data/pr-number.txt")
+            PR_AUTHOR=$(gh pr view "$PR_NUM" --json author --jq '.author.login')
+            if [ "$PR_AUTHOR" != "gemini-cli-robot" ]; then
+              echo "Error: PR #$PR_NUM is authored by '$PR_AUTHOR', not 'gemini-cli-robot'. Skipping PR comment."
+            else
+              gh pr comment "$PR_NUM" -F "${{ runner.temp }}/brain-data/pr-comment.md"
+            fi
+          fi
